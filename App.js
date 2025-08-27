@@ -8,6 +8,7 @@ import {
   Dimensions,
   StatusBar,
   TextInput,
+  AppState,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
@@ -22,6 +23,9 @@ Notifications.setNotificationHandler({
     shouldSetBadge: false,
   }),
 });
+
+// Debug mode - set to false to reduce console logs
+const DEBUG_MODE = false;
 
 const { width, height } = Dimensions.get('window');
 
@@ -50,12 +54,83 @@ export default function App() {
   const [isFirstLaunch, setIsFirstLaunch] = useState(true);
   const [goalReached, setGoalReached] = useState(false);
   const [lastResetDate, setLastResetDate] = useState('');
+  const [lastWaterIntakeTime, setLastWaterIntakeTime] = useState(null);
+  const [lastSyncedIntake, setLastSyncedIntake] = useState(null);
+  const [lastSyncedGoalReached, setLastSyncedGoalReached] = useState(null);
 
   useEffect(() => {
     loadData();
     requestNotificationPermissions();
     setupNotificationListener();
+    setupAppStateListener();
   }, []);
+
+  const setupAppStateListener = () => {
+    const handleAppStateChange = (nextAppState) => {
+      if (nextAppState === 'active') {
+        if (DEBUG_MODE) console.log('📱 App came to foreground, refreshing data...');
+        refreshDataFromStorage();
+        // Check for inactivity when app becomes active
+        checkAndScheduleInactivityReminder();
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    
+    // Also set up a periodic check for data changes and inactivity when app is active
+    const interval = setInterval(() => {
+      if (AppState.currentState === 'active') {
+        refreshDataFromStorage();
+        // Check for inactivity every 5 minutes when app is active
+        checkAndScheduleInactivityReminder();
+      }
+    }, 300000); // Check every 5 minutes when app is active
+    
+    return () => {
+      subscription?.remove();
+      clearInterval(interval);
+    };
+  };
+
+  const refreshDataFromStorage = async () => {
+    try {
+      const [savedIntake, savedGoalReached, lastUpdatedTimestamp] = await Promise.all([
+        AsyncStorage.getItem('currentIntake'),
+        AsyncStorage.getItem('goalReached'),
+        AsyncStorage.getItem('lastUpdatedTimestamp')
+      ]);
+      
+      let hasUpdates = false;
+      
+      if (savedIntake) {
+        const intakeValue = parseFloat(savedIntake);
+        // Only update if the value is actually different and hasn't been synced already
+        if (Math.abs(intakeValue - currentIntake) > 0.01 && intakeValue !== lastSyncedIntake) {
+          if (DEBUG_MODE) console.log(`🔄 Updating intake from storage: ${currentIntake}L -> ${intakeValue}L`);
+          setCurrentIntake(intakeValue);
+          setLastSyncedIntake(intakeValue);
+          hasUpdates = true;
+        }
+      }
+      
+      if (savedGoalReached) {
+        const goalReachedValue = savedGoalReached === 'true';
+        // Only update if the value is actually different and hasn't been synced already
+        if (goalReachedValue !== goalReached && goalReachedValue !== lastSyncedGoalReached) {
+          if (DEBUG_MODE) console.log(`🔄 Updating goal reached from storage: ${goalReached} -> ${goalReachedValue}`);
+          setGoalReached(goalReachedValue);
+          setLastSyncedGoalReached(goalReachedValue);
+          hasUpdates = true;
+        }
+      }
+      
+      if (hasUpdates && DEBUG_MODE) {
+        console.log('✅ Data synchronized from storage');
+      }
+    } catch (error) {
+      console.error('Error refreshing data from storage:', error);
+    }
+  };
 
   useEffect(() => {
     checkAndResetDaily();
@@ -84,21 +159,99 @@ export default function App() {
     };
   };
 
-  const handleNotificationResponse = (response) => {
+  const handleNotificationResponse = async (response) => {
     const { actionIdentifier, notification } = response;
     
     if (actionIdentifier === 'add-200ml') {
       console.log('➕ Adding 200ml from notification');
-      addWater(0.2);
+      
+      // Load current state from AsyncStorage to ensure we have the latest values
+      try {
+        const savedIntake = await AsyncStorage.getItem('currentIntake');
+        const savedGoal = await AsyncStorage.getItem('dailyGoal');
+        const savedGoalReached = await AsyncStorage.getItem('goalReached');
+        
+        const currentSavedIntake = savedIntake ? parseFloat(savedIntake) : 0;
+        const currentSavedGoal = savedGoal ? parseFloat(savedGoal) : 0;
+        const isGoalReached = savedGoalReached === 'true';
+        
+        console.log(`📱 Loaded from storage: Intake=${currentSavedIntake}L, Goal=${currentSavedGoal}L, GoalReached=${isGoalReached}`);
+        
+        // Don't add water if goal is already reached
+        if (isGoalReached) {
+          console.log('❌ Goal already reached, cannot add more water');
+          return;
+        }
+        
+        // Calculate new intake
+        const newIntake = currentSavedIntake + 0.2;
+        console.log(`📊 New intake will be: ${newIntake}L`);
+        
+        // Save new intake to storage immediately
+        await AsyncStorage.setItem('currentIntake', newIntake.toString());
+        await AsyncStorage.setItem('lastUpdatedTimestamp', Date.now().toString());
+        
+        // Record water intake for smart reminder system
+        const currentTime = Date.now();
+        setLastWaterIntakeTime(currentTime);
+        await AsyncStorage.setItem('lastWaterIntakeTime', currentTime.toString());
+        console.log(`📝 Water intake recorded via notification at: ${new Date(currentTime).toLocaleTimeString()}`);
+        
+        // Update app state if app is currently active
+        setCurrentIntake(newIntake);
+        
+        // Check if goal is reached
+        const goalReachedNow = newIntake >= currentSavedGoal && !isGoalReached && currentSavedGoal > 0;
+        
+        if (goalReachedNow) {
+          console.log(`🎉 Goal reached via notification! ${newIntake}L >= ${currentSavedGoal}L`);
+          await AsyncStorage.setItem('goalReached', 'true');
+          setGoalReached(true);
+          
+          // Cancel smart reminders when goal is reached
+          await Notifications.cancelScheduledNotificationAsync('smart-reminder');
+          
+          // Show achievement notification
+          await Notifications.scheduleNotificationAsync({
+            content: {
+              title: "🎉 Goal Achieved!",
+              body: "Congratulations! You've reached your daily water intake goal!",
+              sound: true,
+            },
+            trigger: null,
+          });
+          
+          // Cancel scheduled notifications but keep persistent notification
+          await Notifications.cancelAllScheduledNotificationsAsync();
+        } else {
+          // Cancel any existing reminder since user just drank water
+          await Notifications.cancelScheduledNotificationAsync('smart-reminder');
+          console.log('🚫 Cancelled existing reminder - user just drank water via notification');
+        }
+        
+        // Update persistent notification with fresh values
+        await updatePersistentNotificationWithValues(newIntake, currentSavedGoal, newIntake >= currentSavedGoal);
+        
+        // Force an immediate UI refresh if app is active
+        setTimeout(() => {
+          if (AppState.currentState === 'active') {
+            refreshDataFromStorage();
+          }
+        }, 100);
+        
+      } catch (error) {
+        console.error('❌ Error handling notification response:', error);
+      }
     } else if (actionIdentifier === 'dismiss') {
       console.log('❌ Notification dismissed');
     }
   };
 
-  const updatePersistentNotification = async () => {
+  // Helper function to update persistent notification with specific values
+  const updatePersistentNotificationWithValues = async (intake, goal, goalReached = false) => {
     try {
-      const remainingIntake = Math.max(0, dailyGoal - currentIntake);
-      const percentage = getProgressPercentage();
+      const remainingIntake = Math.max(0, goal - intake);
+      const percentage = goal > 0 ? Math.min((intake / goal) * 100, 100) : 0;
       
       // Cancel existing persistent notification
       await Notifications.cancelScheduledNotificationAsync('persistent-status');
@@ -111,6 +264,7 @@ export default function App() {
           options: {
             isDestructive: false,
             isAuthenticationRequired: false,
+            opensAppToForeground: false, // This prevents opening the app
           },
         },
         {
@@ -119,6 +273,7 @@ export default function App() {
           options: {
             isDestructive: true,
             isAuthenticationRequired: false,
+            opensAppToForeground: false, // This prevents opening the app
           },
         },
       ]);
@@ -127,21 +282,27 @@ export default function App() {
       await Notifications.scheduleNotificationAsync({
         identifier: 'persistent-status',
         content: {
-          title: `💧 ${currentIntake.toFixed(1)}L / ${dailyGoal}L`,
-          body: `Remaining: ${remainingIntake.toFixed(1)}L (${percentage.toFixed(0)}% complete)`,
+          title: `💧 ${intake.toFixed(1)}L / ${goal}L`,
+          body: goalReached 
+            ? `🎉 Goal achieved! Great job staying hydrated!`
+            : `Remaining: ${remainingIntake.toFixed(1)}L (${percentage.toFixed(0)}% complete)`,
           sound: false,
           sticky: true, // This makes it persistent
           autoDismiss: false,
           data: { type: 'persistent-status' },
-          categoryIdentifier: 'persistent-status-actions', // Add action buttons for quick water tracking
+          categoryIdentifier: goalReached ? undefined : 'persistent-status-actions', // Remove actions if goal reached
         },
         trigger: null, // Immediate and persistent
       });
       
-      console.log('📱 Persistent notification updated with action buttons');
+      console.log(`📱 Persistent notification updated: ${intake.toFixed(1)}L / ${goal}L (${percentage.toFixed(0)}%)`);
     } catch (error) {
       console.error('❌ Error updating persistent notification:', error);
     }
+  };
+
+  const updatePersistentNotification = async () => {
+    return await updatePersistentNotificationWithValues(currentIntake, dailyGoal, goalReached);
   };
 
   const requestNotificationPermissions = async () => {
@@ -192,6 +353,7 @@ export default function App() {
       const savedLastReset = await AsyncStorage.getItem('lastResetDate');
       const savedFirstLaunch = await AsyncStorage.getItem('isFirstLaunch');
       const savedGoalReached = await AsyncStorage.getItem('goalReached');
+      const savedLastWaterTime = await AsyncStorage.getItem('lastWaterIntakeTime');
 
       if (savedFirstLaunch === null) {
         setIsFirstLaunch(true);
@@ -201,6 +363,7 @@ export default function App() {
         if (savedIntake) setCurrentIntake(parseFloat(savedIntake));
         if (savedLastReset) setLastResetDate(savedLastReset);
         if (savedGoalReached === 'true') setGoalReached(true);
+        if (savedLastWaterTime) setLastWaterIntakeTime(parseInt(savedLastWaterTime));
       }
     } catch (error) {
       console.error('Error loading data:', error);
@@ -219,11 +382,17 @@ export default function App() {
     setCurrentIntake(0);
     setGoalReached(false);
     setLastResetDate(today);
+    setLastWaterIntakeTime(null);
     
     try {
       await AsyncStorage.setItem('currentIntake', '0');
       await AsyncStorage.setItem('lastResetDate', today);
       await AsyncStorage.setItem('goalReached', 'false');
+      await AsyncStorage.removeItem('lastWaterIntakeTime');
+      
+      // Cancel all smart reminders on daily reset
+      await cancelSmartReminder();
+      
       // Update persistent notification after reset
       await updatePersistentNotification();
     } catch (error) {
@@ -238,6 +407,9 @@ export default function App() {
       setDailyGoal(goal);
       setIsFirstLaunch(false);
       scheduleNotifications();
+      
+      // Start the smart reminder system with inactivity checking
+      await checkAndScheduleInactivityReminder();
     } catch (error) {
       console.error('Error saving goal:', error);
     }
@@ -338,6 +510,7 @@ export default function App() {
           options: {
             isDestructive: false,
             isAuthenticationRequired: false,
+            opensAppToForeground: false, // This prevents opening the app
           },
         },
         {
@@ -346,6 +519,7 @@ export default function App() {
           options: {
             isDestructive: true,
             isAuthenticationRequired: false,
+            opensAppToForeground: false, // This prevents opening the app
           },
         },
       ]);
@@ -390,6 +564,121 @@ export default function App() {
     return waterFacts[Math.floor(Math.random() * waterFacts.length)];
   };
 
+  // Smart reminder system functions
+  const checkAndScheduleInactivityReminder = async () => {
+    try {
+      // Don't schedule if goal is reached
+      if (goalReached) {
+        console.log('🎯 Goal reached, not scheduling reminder');
+        return;
+      }
+      
+      const savedLastWaterTime = await AsyncStorage.getItem('lastWaterIntakeTime');
+      
+      if (!savedLastWaterTime) {
+        // No previous water intake recorded, schedule initial reminder
+        console.log('⏰ No previous water intake, scheduling initial reminder for 1 hour');
+        await scheduleSmartReminder();
+        return;
+      }
+      
+      const lastWaterTime = parseInt(savedLastWaterTime);
+      const currentTime = Date.now();
+      const timeSinceLastWater = currentTime - lastWaterTime;
+      const oneHourInMs = 3600000; // 1 hour = 3,600,000 milliseconds
+      
+      if (timeSinceLastWater >= oneHourInMs) {
+        // User has been inactive for 1+ hours, send reminder now
+        console.log(`🔔 User inactive for ${Math.round(timeSinceLastWater / 1000 / 60)} minutes, sending reminder now`);
+        await Notifications.scheduleNotificationAsync({
+          identifier: 'smart-reminder',
+          content: {
+            title: "💧 Time to Hydrate!",
+            body: getRandomWaterFact(),
+            sound: true,
+            data: { type: 'smart-reminder' },
+            categoryIdentifier: 'water-reminder-actions',
+          },
+          trigger: null, // Send immediately
+        });
+      } else {
+        // Schedule reminder for when 1 hour will be complete
+        const remainingTime = oneHourInMs - timeSinceLastWater;
+        const remainingSeconds = Math.round(remainingTime / 1000);
+        
+        console.log(`⏰ Scheduling reminder in ${Math.round(remainingSeconds / 60)} minutes (when 1 hour of inactivity is reached)`);
+        
+        await Notifications.cancelScheduledNotificationAsync('smart-reminder');
+        await Notifications.scheduleNotificationAsync({
+          identifier: 'smart-reminder',
+          content: {
+            title: "💧 Time to Hydrate!",
+            body: getRandomWaterFact(),
+            sound: true,
+            data: { type: 'smart-reminder' },
+            categoryIdentifier: 'water-reminder-actions',
+          },
+          trigger: {
+            seconds: remainingSeconds,
+          },
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error checking inactivity:', error);
+    }
+  };
+
+  const scheduleSmartReminder = async () => {
+    try {
+      await Notifications.cancelScheduledNotificationAsync('smart-reminder');
+      
+      await Notifications.scheduleNotificationAsync({
+        identifier: 'smart-reminder',
+        content: {
+          title: "💧 Time to Hydrate!",
+          body: getRandomWaterFact(),
+          sound: true,
+          data: { type: 'smart-reminder' },
+          categoryIdentifier: 'water-reminder-actions',
+        },
+        trigger: {
+          seconds: 3600, // 1 hour = 3600 seconds
+        },
+      });
+      
+      console.log('✅ Smart reminder scheduled for 1 hour');
+    } catch (error) {
+      console.error('❌ Error scheduling smart reminder:', error);
+    }
+  };
+
+  const cancelSmartReminder = async () => {
+    try {
+      await Notifications.cancelScheduledNotificationAsync('smart-reminder');
+      console.log('🚫 Smart reminder cancelled');
+    } catch (error) {
+      console.error('❌ Error cancelling smart reminder:', error);
+    }
+  };
+
+  const recordWaterIntake = async () => {
+    const currentTime = Date.now();
+    setLastWaterIntakeTime(currentTime);
+    
+    try {
+      await AsyncStorage.setItem('lastWaterIntakeTime', currentTime.toString());
+      console.log(`📝 Water intake recorded at: ${new Date(currentTime).toLocaleTimeString()}`);
+      
+      // Cancel any existing reminder since user just drank water
+      await cancelSmartReminder();
+      console.log('🚫 Cancelled existing reminder - user just drank water');
+      
+      // Don't schedule new reminder immediately - let the inactivity system handle it
+    } catch (error) {
+      console.error('Error recording water intake time:', error);
+    }
+  };
+
   const addWater = async (amount) => {
     console.log(`💧 Adding ${amount}L water. Current: ${currentIntake}L, Goal: ${dailyGoal}L, GoalReached: ${goalReached}`);
     
@@ -401,22 +690,29 @@ export default function App() {
     const newIntake = currentIntake + amount;
     console.log(`📊 New intake will be: ${newIntake}L`);
     
+    // Update state immediately for UI responsiveness
     setCurrentIntake(newIntake);
 
     try {
       await AsyncStorage.setItem('currentIntake', newIntake.toString());
+      await AsyncStorage.setItem('lastUpdatedTimestamp', Date.now().toString());
     } catch (error) {
       console.error('Error saving intake:', error);
     }
 
-    // Update persistent notification when water is added
-    await updatePersistentNotification();
+    // Record water intake for smart reminder system
+    await recordWaterIntake();
 
     // Check if goal is reached with more precise comparison
-    if (newIntake >= dailyGoal && !goalReached && dailyGoal > 0) {
+    const isGoalReached = newIntake >= dailyGoal && !goalReached && dailyGoal > 0;
+    
+    if (isGoalReached) {
       console.log(`🎉 Goal reached! ${newIntake}L >= ${dailyGoal}L`);
       setGoalReached(true);
       await AsyncStorage.setItem('goalReached', 'true');
+      
+      // Cancel smart reminders when goal is reached
+      await cancelSmartReminder();
       
       // Show achievement notification
       await Notifications.scheduleNotificationAsync({
@@ -430,8 +726,6 @@ export default function App() {
       
       // Cancel scheduled notifications but keep persistent notification
       await Notifications.cancelAllScheduledNotificationsAsync();
-      // Update persistent notification to show goal achieved
-      await updatePersistentNotification();
       
       // Show alert after a short delay to avoid conflicts
       setTimeout(() => {
@@ -444,6 +738,9 @@ export default function App() {
     } else {
       console.log(`📈 Progress: ${newIntake}L / ${dailyGoal}L (${((newIntake / dailyGoal) * 100).toFixed(1)}%)`);
     }
+
+    // Update persistent notification with the new values
+    await updatePersistentNotificationWithValues(newIntake, dailyGoal, isGoalReached);
   };
 
   const getProgressPercentage = () => {
@@ -544,7 +841,9 @@ export default function App() {
                         'currentIntake',
                         'lastResetDate',
                         'goalReached',
-                        'isFirstLaunch'
+                        'isFirstLaunch',
+                        'lastWaterIntakeTime',
+                        'lastUpdatedTimestamp'
                       ]);
                       // Cancel all notifications including persistent
                       await Notifications.cancelAllScheduledNotificationsAsync();
@@ -553,6 +852,7 @@ export default function App() {
                       setCurrentIntake(0);
                       setGoalReached(false);
                       setLastResetDate('');
+                      setLastWaterIntakeTime(null);
                       setIsFirstLaunch(true);
                     } catch (error) {
                       console.error('Error resetting app:', error);
@@ -566,95 +866,7 @@ export default function App() {
           <Text style={styles.resetButtonText}>Change Goal</Text>
         </TouchableOpacity>
 
-        {/* Debug button for testing notifications */}
-        <TouchableOpacity
-          style={[styles.resetButton, { marginTop: 10, backgroundColor: '#9C27B0' }]}
-          activeOpacity={0.7}
-          onPress={async () => {
-            console.log('🔧 Debug button pressed');
-            
-            // Check permissions
-            const { status } = await Notifications.getPermissionsAsync();
-            console.log('📱 Current permission status:', status);
-            
-            // List scheduled notifications
-            const scheduledNotifications = await Notifications.getAllScheduledNotificationsAsync();
-            console.log('📋 Scheduled notifications:', scheduledNotifications.length);
-            
-            // Show current app state
-            console.log(`📊 Current State: Intake=${currentIntake}L, Goal=${dailyGoal}L, GoalReached=${goalReached}`);
-            
-            Alert.alert(
-              'Debug Info',
-              `Current State:\nIntake: ${currentIntake}L\nGoal: ${dailyGoal}L\nGoal Reached: ${goalReached}\n\nPermissions: ${status}\nScheduled: ${scheduledNotifications.length}`,
-              [{ text: 'OK' }]
-            );
-          }}
-        >
-          <Text style={styles.resetButtonText}>Debug State</Text>
-        </TouchableOpacity>
 
-        {/* Custom Notification Testing Panel */}
-        <TouchableOpacity
-          style={[styles.resetButton, { marginTop: 10, backgroundColor: '#FF9800' }]}
-          activeOpacity={0.7}
-          onPress={async () => {
-            Alert.alert(
-              'Custom Notification Testing',
-              'Choose a test scenario:',
-              [
-                { text: 'Cancel', style: 'cancel' },
-                { 
-                  text: 'Water Fact + Actions', 
-                  onPress: async () => {
-                    await Notifications.scheduleNotificationAsync({
-                      content: {
-                        title: "Time to Hydrate! 💧",
-                        body: getRandomWaterFact(),
-                        sound: true,
-                        categoryIdentifier: 'water-reminder-actions',
-                      },
-                      trigger: null,
-                    });
-                  }
-                },
-                { 
-                  text: 'Goal Achievement', 
-                  onPress: async () => {
-                    await Notifications.scheduleNotificationAsync({
-                      content: {
-                        title: "🎉 Goal Achieved!",
-                        body: "Congratulations! You've reached your daily water intake goal!",
-                        sound: true,
-                      },
-                      trigger: null,
-                    });
-                  }
-                },
-                { 
-                  text: 'Update Persistent', 
-                  onPress: async () => {
-                    await updatePersistentNotification();
-                    Alert.alert('Success', 'Persistent notification updated with action buttons!');
-                  }
-                },
-                { 
-                  text: 'Force Refresh Persistent', 
-                  onPress: async () => {
-                    // Cancel and recreate the persistent notification
-                    await Notifications.cancelScheduledNotificationAsync('persistent-status');
-                    setTimeout(async () => {
-                      await updatePersistentNotification();
-                      Alert.alert('Success', 'Persistent notification refreshed!');
-                    }, 1000);
-                  }
-                }
-              ]
-            );
-          }}
-        >
-          <Text style={styles.resetButtonText}>Test Custom Notifications</Text>
-        </TouchableOpacity>
       </View>
     </LinearGradient>
   );
